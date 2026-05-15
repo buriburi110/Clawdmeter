@@ -13,9 +13,28 @@ daemon will pair with this one without re-flashing.
 | HTTP client | `httpx` | stdlib `urllib` (one less wheel to install) |
 | BLE backend | bleak / CoreBluetooth or BlueZ | bleak / WinRT |
 | Console-only verification | not built in | `--no-ble` / `--once` flags |
+| Token auto-refresh | not built in | yes, via Claude Code CLI wrapper |
 
 API call, response-header parsing, payload shape, BLE UUIDs and
 reconnect / backoff logic are all kept identical.
+
+### About auto-refresh
+
+Anthropic's OAuth refresh endpoint isn't publicly documented, so we don't
+re-implement it. Instead, when the access token's `expiresAt` is within 60
+seconds of now, the daemon shells out to `claude.exe -p hi` once. The CLI
+checks `expiresAt` on startup, uses the stored `refreshToken` to fetch a
+new access token, rewrites `~/.claude/.credentials.json`, then exits. We
+re-read the file and continue polling. No extra credentials, no
+reverse-engineering, no maintenance burden when Anthropic rotates their
+OAuth flow.
+
+The CLI is found by globbing
+`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code\*\claude.exe`
+and picking the most recently modified version directory, so app upgrades
+are followed automatically. If the CLI isn't installed, auto-refresh is
+silently skipped and the daemon falls back to its previous behaviour
+(log a 401 and try again next poll).
 
 ## Status
 
@@ -24,6 +43,7 @@ reconnect / backoff logic are all kept identical.
 - [x] Builds the `{s, sr, w, wr, st, ok}` payload the firmware expects
 - [x] BLE scan / connect / write / refresh-notify (via `bleak`)
 - [x] Console-only mode for board-free verification
+- [x] Automatic token refresh (delegates to the Claude Code CLI)
 - [ ] Hardware-tested (waiting on board)
 
 ## Requirements
@@ -82,11 +102,13 @@ Written byte-identical to the firmware's `RX` characteristic
 
 ## Known limitations
 
-- **No automatic refresh-token handling** - the original doesn't ship this
-  either. If the access token expires, the daemon logs a 401 and keeps
-  trying. Refresh by running the Claude Code CLI once
-  (`claude.exe -p "hi"` from a new shell). Auto-refresh is a candidate
-  for a follow-up.
+- **Auto-refresh requires Claude Code CLI installed.** If the CLI isn't
+  found under `%LOCALAPPDATA%\Packages\Claude_*\...`, the daemon logs the
+  miss and falls back to "log 401 and retry next poll" - the original
+  behaviour. Install Claude Code (any recent version) to enable refresh.
+- **Auto-refresh blocks the poll loop briefly.** Each refresh runs
+  `claude.exe -p hi` and waits for it to exit (timeout 20 s). On a slow
+  network this can stall a single poll cycle by a few seconds.
 - **Windows BLE quirks**: `bleak`'s WinRT backend requires Bluetooth to
   be enabled in Windows Settings, and pairing is sometimes flakier than
   on Linux. If you see `OSError: [WinError -2147418113]` during

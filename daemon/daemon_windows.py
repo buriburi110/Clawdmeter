@@ -27,6 +27,7 @@ import asyncio
 import json
 import re
 import signal
+import subprocess
 import sys
 import time
 import urllib.error
@@ -41,6 +42,13 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+
+# Refresh the access token if it expires in less than this many seconds.
+# Anthropic's refresh endpoint isn't publicly documented, so we delegate
+# to the Claude Code CLI which knows how to use the refreshToken.
+TOKEN_REFRESH_GRACE_S = 60
+CLI_REFRESH_TIMEOUT_S = 20
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
@@ -90,12 +98,96 @@ def _extract_access_token(blob: str) -> str | None:
     return None
 
 
+def _find_claude_cli() -> Path | None:
+    """Locate the Claude Code CLI exe under the MS Store package layout.
+
+    The file under %APPDATA%\\Roaming\\Claude\\claude-code\\... is a reparse
+    point that PowerShell's `&` operator can't follow; the real binary lives
+    under %LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\... . Pick the most
+    recently modified version directory so we follow upgrades automatically.
+    """
+    base = Path.home() / "AppData" / "Local" / "Packages"
+    matches = list(base.glob("Claude_*/LocalCache/Roaming/Claude/claude-code/*/claude.exe"))
+    if not matches:
+        # Fall back to the reparse-point path; subprocess.run can sometimes
+        # follow it even when PowerShell can't.
+        legacy = list((Path.home() / "AppData" / "Roaming" / "Claude" / "claude-code").glob("*/claude.exe"))
+        matches = legacy
+    if not matches:
+        return None
+    matches.sort(key=lambda p: p.stat().st_mtime)
+    return matches[-1]
+
+
+def _refresh_token_via_cli() -> bool:
+    """Trigger the Claude Code CLI to refresh ~/.claude/.credentials.json.
+
+    The CLI checks `expiresAt` on startup and uses the stored refreshToken
+    to fetch a new access token via Anthropic's (undocumented) OAuth refresh
+    endpoint. We invoke it with `-p hi` so it answers a one-line prompt and
+    exits; the side effect is a refreshed credentials file.
+    """
+    cli = _find_claude_cli()
+    if not cli:
+        log("Auto-refresh skipped: claude.exe not found")
+        return False
+    log(f"Refreshing token via {cli.parent.name}/claude.exe ...")
+    try:
+        proc = subprocess.run(
+            [str(cli), "-p", "hi"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=CLI_REFRESH_TIMEOUT_S,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        log("Auto-refresh timed out")
+        return False
+    except OSError as e:
+        log(f"Auto-refresh launch failed: {e}")
+        return False
+    if proc.returncode != 0:
+        log(f"Auto-refresh exit {proc.returncode}: {proc.stderr.strip()[:200]}")
+        return False
+    return True
+
+
+def _credentials_expired(raw: str) -> bool:
+    """Return True if the credentials blob's expiresAt is in the past or near it."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        oauth = data
+    expires_ms = oauth.get("expiresAt")
+    if not isinstance(expires_ms, (int, float)):
+        return False
+    return (expires_ms / 1000) - TOKEN_REFRESH_GRACE_S < time.time()
+
+
 def read_token() -> str | None:
+    """Read the access token, refreshing via the CLI if it has expired.
+
+    This is a blocking call (the CLI takes a couple of seconds); the BLE
+    and console loops both wrap it with `asyncio.to_thread`.
+    """
     try:
         raw = CREDENTIALS_PATH.read_text(encoding="utf-8")
     except OSError as e:
         log(f"Error reading credentials: {e}")
         return None
+    if _credentials_expired(raw):
+        log("Access token expired or expiring soon; refreshing")
+        if _refresh_token_via_cli():
+            try:
+                raw = CREDENTIALS_PATH.read_text(encoding="utf-8")
+            except OSError as e:
+                log(f"Error re-reading credentials after refresh: {e}")
     return _extract_access_token(raw)
 
 
@@ -261,7 +353,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event,
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                token = read_token()
+                token = await asyncio.to_thread(read_token)
                 if not token:
                     log("No token; skipping poll")
                 else:
@@ -329,7 +421,7 @@ async def console_main(stop_event: asyncio.Event, once: bool) -> None:
     if not once:
         log(f"Poll interval: {POLL_INTERVAL}s. Ctrl+C to stop.")
     while not stop_event.is_set():
-        token = read_token()
+        token = await asyncio.to_thread(read_token)
         if not token:
             log("No token; sleeping")
         else:
