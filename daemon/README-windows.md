@@ -1,57 +1,93 @@
-# Clawdmeter - Windows daemon (alternative)
+# Clawdmeter - Windows daemon
 
-Windows-friendly Python daemon for the Clawdmeter project.
+Windows port of `claude_usage_daemon.py`. **Wire-compatible** with the
+existing firmware - same payload, same BLE service / characteristic UUIDs,
+same poll interval - so a board that already pairs with the macOS / Linux
+daemon will pair with this one without re-flashing.
+
+## What changed vs. the original
+
+| | Original (macOS / Linux) | Windows |
+| --- | --- | --- |
+| Token store | macOS Keychain (`security find-generic-password`) or `~/.claude/.credentials.json` | `%USERPROFILE%\.claude\.credentials.json` only |
+| HTTP client | `httpx` | stdlib `urllib` (one less wheel to install) |
+| BLE backend | bleak / CoreBluetooth or BlueZ | bleak / WinRT |
+| Console-only verification | not built in | `--no-ble` / `--once` flags |
+
+API call, response-header parsing, payload shape, BLE UUIDs and
+reconnect / backoff logic are all kept identical.
 
 ## Status
 
-- [x] Polls Claude Code usage every 60 seconds
+- [x] Polls Claude Code usage every 60 seconds via `POST /v1/messages`
 - [x] Reads OAuth token from `%USERPROFILE%\.claude\.credentials.json`
-- [ ] BLE write (firmware integration) - planned once an ESP32-S3 board is in hand
-- [ ] Automatic refresh-token handling
-
-## Why a separate daemon
-
-The original `claude_usage_daemon.py` parses rate-limit headers returned by a
-1-token `/v1/messages` call. This Windows variant calls the dedicated
-`GET /api/oauth/usage` endpoint instead, which:
-
-- returns 5h / 7d / 7d-Opus utilization as structured JSON,
-- consumes no inference tokens,
-- uses no third-party dependencies (Python stdlib only).
-
-Functionally equivalent for the meter; different transport.
+- [x] Builds the `{s, sr, w, wr, st, ok}` payload the firmware expects
+- [x] BLE scan / connect / write / refresh-notify (via `bleak`)
+- [x] Console-only mode for board-free verification
+- [ ] Hardware-tested (waiting on board)
 
 ## Requirements
 
 - Windows 10 / 11
-- Python 3.7+
+- Python 3.9+
 - A logged-in Claude Code session (so `~/.claude/.credentials.json` exists)
+- For BLE mode: `pip install -r daemon/requirements-windows.txt`
+  (installs `bleak`; not needed for `--no-ble`)
 
 ## Run
 
-One-shot (handy for verification):
+**Verify the API/payload pipeline without a board:**
 
 ```powershell
-python daemon\daemon_windows.py --once
+python daemon\daemon_windows.py --once --no-ble
 ```
 
-Continuous (60-second polling):
+Expected:
+
+```
+[21:38:05] === Claude Usage Tracker Daemon (console, Windows) ===
+[21:38:06] Payload: {"s":12,"sr":251,"w":38,"wr":2601,"st":"ok","ok":true}
+```
+
+**Continuous console loop** (still no board):
 
 ```powershell
+python daemon\daemon_windows.py --no-ble
+```
+
+**Full BLE daemon** (needs board paired and reachable):
+
+```powershell
+pip install -r daemon\requirements-windows.txt
 python daemon\daemon_windows.py
 ```
 
-## Sample output
+The cached BLE address lives at
+`%USERPROFILE%\.config\claude-usage-monitor\ble-address` - same path the
+original daemon uses, so caches are interchangeable across OSes.
 
-```
-Token loaded (108 chars).
-[21:38:05] 5h:  12.0% (reset in 251m)  |  7d:  38.0% (reset in 2601m)
-```
+## Payload reference
+
+Written byte-identical to the firmware's `RX` characteristic
+(`4c41555a-4465-7669-6365-000000000002`):
+
+| Key | Type | Source header | Meaning |
+| --- | --- | --- | --- |
+| `s` | int 0..100 | `anthropic-ratelimit-unified-5h-utilization` * 100 | 5-hour window utilization % |
+| `sr` | int (minutes) | `anthropic-ratelimit-unified-5h-reset` - now | minutes until 5h reset (0 if past) |
+| `w` | int 0..100 | `anthropic-ratelimit-unified-7d-utilization` * 100 | 7-day window utilization % |
+| `wr` | int (minutes) | `anthropic-ratelimit-unified-7d-reset` - now | minutes until 7d reset (0 if past) |
+| `st` | string | `anthropic-ratelimit-unified-5h-status` | status string (e.g. `"ok"`) |
+| `ok` | bool | derived | true if HTTP status < 400 |
 
 ## Known limitations
 
-- If the access token has expired, the daemon prints a warning and the API
-  returns HTTP 401. Refresh by running the Claude Code CLI once; auto-refresh
-  will be added later.
-- BLE write is not implemented yet. Use the original Linux/macOS daemon if
-  you have a working board, or wait for the firmware integration.
+- **No automatic refresh-token handling** - the original doesn't ship this
+  either. If the access token expires, the daemon logs a 401 and keeps
+  trying. Refresh by running the Claude Code CLI once
+  (`claude.exe -p "hi"` from a new shell). Auto-refresh is a candidate
+  for a follow-up.
+- **Windows BLE quirks**: `bleak`'s WinRT backend requires Bluetooth to
+  be enabled in Windows Settings, and pairing is sometimes flakier than
+  on Linux. If you see `OSError: [WinError -2147418113]` during
+  `connect()`, toggle Bluetooth off/on in Windows Settings and retry.

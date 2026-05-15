@@ -1,0 +1,3 @@
+# Required only for the BLE mode (default). The console-only mode
+# (`--no-ble`) runs on stdlib alone.
+bleak>=0.22.0
