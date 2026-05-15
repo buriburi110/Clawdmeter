@@ -1,5 +1,18 @@
 # Clawdmeter - Windows daemon
 
+> **Status: pre-release / hardware-untested.**
+> The author hasn't received the ESP32-S3 board yet, so only the
+> console-mode pipeline (token read -> API poll -> payload build) has
+> been verified end-to-end on Windows. The BLE scan / connect / write /
+> notify path is a port of the upstream daemon and should work as-is via
+> bleak's WinRT backend, but real pairing has **not** been tested. Once
+> the board arrives, the daemon will be exercised against real hardware
+> and a follow-up commit / release will land here with whatever fixes
+> are needed.
+>
+> If you try this against a board before that happens and hit BLE
+> issues, please open an issue - it'll directly inform the patch.
+
 Windows port of `claude_usage_daemon.py`. **Wire-compatible** with the
 existing firmware - same payload, same BLE service / characteristic UUIDs,
 same poll interval - so a board that already pairs with the macOS / Linux
